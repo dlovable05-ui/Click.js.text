@@ -1,0 +1,144 @@
+// adsgram-clicks.js — standalone, no dependencies.
+// window.watchAdsGram('45020', 3) -> { ok, clicks, seconds }
+
+const REQUIRED_CLICKS = 3
+const FAKE_CLICK_MS = 800
+const SDK = 'https://sad.adsgram.ai/js/sad.min.js'
+
+let sdkPromise = null
+
+function loadSdk() {
+  if (sdkPromise) return sdkPromise
+  sdkPromise = new Promise((resolve, reject) => {
+    if (window.Adsgram) return resolve()
+    const el = document.createElement('script')
+    el.src = SDK
+    el.async = true
+    el.onload = () => resolve()
+    el.onerror = () => reject(new Error('adsgram sdk failed to load'))
+    document.head.appendChild(el)
+  })
+  return sdkPromise
+}
+
+function createDetector() {
+  let networkClicks = 0
+  let domClicks = 0
+  let away = false
+  let leftAt = 0
+  let armed = false
+  let stopped = false
+  let startedAt = 0
+
+  const originalFetch = window.fetch
+  const originalOpen = XMLHttpRequest.prototype.open
+  let patchedFetch = null
+
+  const sniff = (url) => {
+    try {
+      if (url && /[?&]type=Click(&|$)/i.test(String(url))) networkClicks += 1
+    } catch {}
+  }
+
+  const onLeave = () => {
+    if (!armed || stopped || away) return
+    away = true
+    leftAt = Date.now()
+  }
+
+  const onReturn = () => {
+    if (!armed || stopped || !away) return
+    away = false
+    if (networkClicks === 0 && Date.now() - leftAt < FAKE_CLICK_MS) return
+    domClicks += 1
+  }
+
+  const onVisibility = () => (document.hidden ? onLeave() : onReturn())
+
+  return {
+    begin() {
+      startedAt = Date.now()
+
+      patchedFetch = function (...args) {
+        const a = args[0]
+        sniff(typeof a === 'string' ? a : a instanceof Request ? a.url : a?.url)
+        return originalFetch.apply(this, args)
+      }
+      window.fetch = patchedFetch
+
+      XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+        sniff(url)
+        return originalOpen.call(this, method, url, ...rest)
+      }
+
+      document.addEventListener('visibilitychange', onVisibility)
+      window.addEventListener('blur', onLeave)
+      window.addEventListener('focus', onReturn)
+      window.addEventListener('pagehide', onLeave)
+    },
+
+    arm() {
+      armed = true
+    },
+
+    end() {
+      if (stopped) return
+      stopped = true
+      if (window.fetch === patchedFetch) window.fetch = originalFetch
+      XMLHttpRequest.prototype.open = originalOpen
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.removeEventListener('blur', onLeave)
+      window.removeEventListener('focus', onReturn)
+      window.removeEventListener('pagehide', onLeave)
+    },
+
+    result() {
+      return {
+        clicks: Math.max(networkClicks, domClicks),
+        networkClicks,
+        domClicks,
+        seconds: startedAt ? Math.round((Date.now() - startedAt) / 1000) : 0,
+      }
+    },
+  }
+}
+
+export async function watchAdsGram(blockId, requiredClicks = REQUIRED_CLICKS, userId) {
+  await loadSdk()
+  if (!window.Adsgram) throw new Error('adsgram sdk unavailable')
+
+  const controller = window.Adsgram.init({
+    blockId: String(blockId),
+    ...(userId ? { userid: String(userId) } : {}),
+  })
+
+  const detector = createDetector()
+  detector.begin()
+
+  let done = true
+  let error = null
+
+  try {
+    const res = await controller.show({ onStart: () => detector.arm() })
+    if (res && res.done === false) done = false
+  } catch (err) {
+    error = err?.description || err?.error || err?.message || 'ad failed'
+    done = false
+  } finally {
+    detector.end()
+  }
+
+  const seen = detector.result()
+
+  return {
+    ok: done && !error && seen.clicks >= requiredClicks,
+    clicks: seen.clicks,
+    required: requiredClicks,
+    networkClicks: seen.networkClicks,
+    domClicks: seen.domClicks,
+    seconds: seen.seconds,
+    error,
+  }
+}
+
+if (typeof window !== 'undefined') window.watchAdsGram = watchAdsGram
